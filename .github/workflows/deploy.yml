@@ -3,6 +3,9 @@ name: Deploy to Cloudflare Pages
 on:
   push:
     branches: [main]
+  # Pull requests get their own preview URL, so a change can be opened on a
+  # real phone before it reaches production.
+  pull_request:
   # Lets you redeploy from the Actions tab without pushing a commit.
   workflow_dispatch:
 
@@ -52,4 +55,9 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy build/web --project-name=porfolio-3d
+          # Cloudflare treats the project's production branch specially: `main`
+          # publishes to the live URL, anything else gets its own preview URL.
+          command: >-
+            pages deploy build/web
+            --project-name=porfolio-3d
+            --branch=${{ github.head_ref || github.ref_name }}
