@@ -1,0 +1,464 @@
+import 'dart:typed_data';
+
+import 'package:flutter_scene/src/fog.dart';
+import 'package:flutter_scene/src/gpu/gpu.dart' as gpu;
+import 'package:flutter_scene/src/light.dart';
+import 'package:flutter_scene/src/material/environment.dart';
+import 'package:flutter_scene/src/material/material.dart';
+import 'package:flutter_scene/src/render/custom_render_pass.dart';
+import 'package:flutter_scene/src/render/frame_transients.dart';
+
+/// Packs the engine lighting half of the shared `FragInfo` uniform block and
+/// binds the image-based-lighting and shadow samplers.
+///
+/// The `FragInfo` block (declared in `shaders/material_engine_lighting.glsl`
+/// and read by `EvaluateLighting` in `material_lighting.glsl`) mixes
+/// material-specific fields with engine lighting / IBL / shadow fields. This
+/// helper owns the lighting fields, which are identical for every lit material;
+/// callers add their own material fields (if any) to the same buffer. Both
+/// [PhysicallyBasedMaterial] and `PreprocessedMaterial` use it so the lighting
+/// packing lives in one place.
+class EngineLightingUniforms {
+  /// The float count of the full `FragInfo` block (656 bytes / 164 floats:
+  /// the mat4 `environment_transform` ends at float 155, the `ssao_params`
+  /// vec4 at floats 156..159, then the `radiance_blend` vec4 at floats
+  /// 160..163). See the layout map in the implementation.
+  static const fragInfoFloatCount = 164;
+
+  /// Index of the LOD cross-fade `fade` field in `FragInfo`, occupying std140
+  /// padding before `environment_transform` (so the block size is unchanged).
+  static const fadeIndex = 137;
+
+  /// Default geometric-specular-antialiasing strength and threshold, matching
+  /// [PhysicallyBasedMaterial]'s defaults. Packed at [138]/[139] (the remaining
+  /// std140 padding after `fade`) so every lit material gets antialiasing by
+  /// default; a material that exposes the knobs overwrites these afterward.
+  static const defaultSpecularAaVariance = 0.15;
+  static const defaultSpecularAaThreshold = 0.2;
+
+  /// Writes the engine lighting / IBL / shadow fields of `FragInfo` into
+  /// [fragInfo] from [lighting] and [env]. Leaves the material-specific fields
+  /// (color, factors, alpha mode) untouched for the caller to fill.
+  static void packInto(
+    Float32List fragInfo,
+    Lighting lighting,
+    EnvironmentMap env,
+  ) {
+    // Default to fully drawn; a material with an active LOD cross-fade
+    // overwrites this. Without it the zero-initialized slot would discard
+    // every fragment.
+    fragInfo[fadeIndex] = 1.0;
+    final light = lighting.directionalLight;
+    final cascades = lighting.shadowMap == null
+        ? const <ShadowCascade>[]
+        : lighting.cascades;
+
+    // diffuse_sh0..8 at [8..43] are now unused: the shader samples the
+    // sh_coefficients texture (bound in bindEngineTextures) instead, so the
+    // GPU-computed coefficients of a baked sky need no read-back. Left zero.
+
+    // directional_light_direction [44..47], directional_light_color [48..51].
+    if (light != null) {
+      // The world-space direction comes from the light node's transform;
+      // fall back to the light's own field for a node-less light.
+      final direction = lighting.directionalLightDirection ?? light.direction;
+      fragInfo[44] = direction.x;
+      fragInfo[45] = direction.y;
+      fragInfo[46] = direction.z;
+      fragInfo[48] = light.color.x * light.intensity;
+      fragInfo[49] = light.color.y * light.intensity;
+      fragInfo[50] = light.color.z * light.intensity;
+    }
+    // light_space_matrix[4] at [52..115], cascade_box_sizes at [116..119].
+    for (var i = 0; i < cascades.length; i++) {
+      fragInfo.setRange(
+        52 + i * 16,
+        68 + i * 16,
+        cascades[i].lightSpaceMatrix.storage,
+      );
+      fragInfo[116 + i] = cascades[i].boxSize;
+    }
+    fragInfo[126] = lighting.environmentIntensity;
+    fragInfo[127] = light != null ? 1.0 : 0.0;
+    fragInfo[128] = cascades.isEmpty ? 0.0 : 1.0;
+    fragInfo[129] = light?.shadowDepthBias ?? 0.0;
+    fragInfo[130] = light?.shadowNormalBias ?? 0.0;
+    fragInfo[131] = light == null ? 0.0 : 1.0 / light.shadowMapResolution;
+    fragInfo[134] = light?.shadowFadeRange ?? 0.0;
+    fragInfo[135] = light?.shadowSoftness ?? 0.0;
+    fragInfo[136] = cascades.length.toDouble();
+    // Geometric specular antialiasing at [138]/[139] (specular_aa_variance and
+    // specular_aa_threshold). Defaults for every lit material; a material with
+    // its own knobs overwrites these after packInto.
+    fragInfo[138] = defaultSpecularAaVariance;
+    fragInfo[139] = defaultSpecularAaThreshold;
+    // environment_transform: a mat4 carrying the 3x3 rotation; std140 mat4
+    // columns are 16 bytes each, at [140], [144], [148], [152].
+    final envTransform = lighting.environmentTransform.storage;
+    for (var col = 0; col < 3; col++) {
+      fragInfo[140 + col * 4] = envTransform[col * 3];
+      fragInfo[141 + col * 4] = envTransform[col * 3 + 1];
+      fragInfo[142 + col * 4] = envTransform[col * 3 + 2];
+    }
+    fragInfo[155] = 1.0; // mat4 column 3 = (0, 0, 0, 1)
+    // ssao_params at [156..159]: occlusion enabled, specular occlusion
+    // enabled, and the reciprocal render-target size (for the gl_FragCoord
+    // to occlusion-UV mapping).
+    fragInfo[156] = lighting.ssaoMap != null ? 1.0 : 0.0;
+    fragInfo[157] = lighting.specularOcclusionMode;
+    final viewport = lighting.viewportSize;
+    fragInfo[158] = viewport.width > 0 ? 1.0 / viewport.width : 0.0;
+    fragInfo[159] = viewport.height > 0 ? 1.0 / viewport.height : 0.0;
+    // radiance_blend at [160..163]: x is the IBL cross-fade factor toward the
+    // secondary environment (0 and ignored when there is no secondary); y is
+    // the shadow-ambient strength (how much the cast shadow darkens the IBL
+    // ambient, 0 leaves it physical); zw reserved.
+    fragInfo[160] = lighting.environmentMapB != null
+        ? lighting.environmentBlend.clamp(0.0, 1.0)
+        : 0.0;
+    fragInfo[161] = light?.shadowAmbientStrength.clamp(0.0, 1.0) ?? 0.0;
+    // punctual_dims [8..10] (the first unused diffuse-SH vec4 slot): the
+    // dimensions the shader needs to normalize its punctual-light fetches.
+    // x: parameters-texture row count (all scene lights). y/z: the light-index
+    // texture width/height. These are frame-constant. The per-object slice
+    // (radiance_blend.z count, .w offset) is written per draw by the material.
+    fragInfo[8] = lighting.punctualParamsCount.toDouble();
+    fragInfo[9] = lighting.punctualIndexWidth.toDouble();
+    fragInfo[10] = lighting.punctualIndexHeight.toDouble();
+    // spot_shadow_params [12..15] (more of the unused SH region): the shared
+    // spot-shadow parameters. count 0 disables spot shadow sampling; the shader
+    // also uses count to size the shared shadow atlas (cascades + spot tiles).
+    fragInfo[12] = lighting.spotShadowCount.toDouble();
+    fragInfo[13] = lighting.spotShadowDepthBias;
+    fragInfo[14] = lighting.spotShadowNormalBias;
+    fragInfo[15] = lighting.spotShadowSoftness;
+    // scene_inputs [16..19] (more of the unused SH region): gates for the
+    // material scene-input samplers (bound only into materials that declare
+    // engine_inputs) and the engine time. The opaque snapshot exists only
+    // while translucent draws encode, so opaque draws read 0 for x.
+    fragInfo[16] = lighting.opaqueSceneColor != null ? 1.0 : 0.0;
+    fragInfo[17] = lighting.sceneDepthLinear != null ? 1.0 : 0.0;
+    fragInfo[18] = lighting.time;
+    // scene_inputs.w / camera_forward.w: the projection's half-fov
+    // tangents, for materials that project world positions to screen UV
+    // (screen-space reflection marches). Zero when non-perspective.
+    fragInfo[19] = lighting.tanHalfFovX;
+    // camera_forward [20..23]: the camera's world-space forward direction,
+    // for a fragment's planar view depth (dot(-v_viewvector, forward)).
+    final forward = lighting.cameraForward;
+    if (forward != null) {
+      fragInfo[20] = forward.x;
+      fragInfo[21] = forward.y;
+      fragInfo[22] = forward.z;
+    }
+    fragInfo[23] = lighting.tanHalfFovY;
+  }
+
+  /// Packs the `FogInfo` block (6 vec4s / 24 floats, see `shaders/fog.glsl`)
+  /// from [lighting]'s fog and directional light, and binds it on [shader].
+  /// Every material shader declares `FogInfo`, so this is always bound; when
+  /// there is no fog the `enabled` flag is 0 and `ApplyFog` is a no-op.
+  static void bindFog(
+    gpu.RenderPass pass,
+    gpu.Shader shader,
+    TransientWriter transientsBuffer,
+    Lighting lighting,
+  ) {
+    // Frame-constant per (pass, shader, lighting); see the bind memo above.
+    if (_memoPassIs(pass) && identical(_fogMemo[shader], lighting)) {
+      return;
+    }
+    _fogMemo[shader] = lighting;
+    final fog = lighting.fog;
+    final buffer = Float32List(24);
+    if (fog != null && fog.enabled && fog.mode != FogMode.none) {
+      // params0: mode, enabled, maxOpacity, sky-color influence.
+      buffer[0] = fog.mode.index.toDouble();
+      buffer[1] = 1.0;
+      buffer[2] = fog.maxOpacity.clamp(0.0, 1.0);
+      buffer[3] = fog.skyColorInfluence.clamp(0.0, 1.0);
+      // params1: density, start, end, cutoffDistance.
+      buffer[4] = fog.density;
+      buffer[5] = fog.start;
+      buffer[6] = fog.end;
+      buffer[7] = fog.cutoffDistance;
+      // params2: height, heightFalloff, sunInScatter, sunExponent.
+      buffer[8] = fog.height;
+      buffer[9] = fog.heightFalloff;
+      buffer[10] = fog.sunInScatter;
+      buffer[11] = fog.sunInScatterExponent;
+      // color.
+      buffer[12] = fog.color.x;
+      buffer[13] = fog.color.y;
+      buffer[14] = fog.color.z;
+      // sun color * intensity + has-sun, and sun travel direction. Reuses the
+      // scene's directional light (the same source packInto uses for lighting).
+      final light = lighting.directionalLight;
+      if (light != null && fog.sunInScatter > 0.0) {
+        buffer[16] = light.color.x * light.intensity;
+        buffer[17] = light.color.y * light.intensity;
+        buffer[18] = light.color.z * light.intensity;
+        buffer[19] = 1.0; // has-sun
+        final direction = lighting.directionalLightDirection ?? light.direction;
+        buffer[20] = direction.x;
+        buffer[21] = direction.y;
+        buffer[22] = direction.z;
+      }
+    }
+    // buffer[1] left 0 (disabled) when there is no active fog.
+    pass.bindUniform(
+      shader.getUniformSlot('FogInfo'),
+      transientsBuffer.emplace(ByteData.sublistView(buffer)),
+    );
+  }
+
+  // Tiny constant uniform blocks (std140, 16 bytes) selecting the bound
+  // prefiltered radiance's layout in the shader (RadianceLayoutInfo in
+  // texture.glsl); device-resident so binding needs no per-frame buffer.
+  // (mip_layout, cube_layout). Cube: read the samplerCube. Mip: the 2D mip
+  // equirect. Atlas: the legacy 2D stacked-band equirect.
+  static final gpu.BufferView _layoutCube = _layoutFlagBuffer(0.0, 1.0);
+  static final gpu.BufferView _layoutMip = _layoutFlagBuffer(1.0, 0.0);
+  static final gpu.BufferView _layoutAtlas = _layoutFlagBuffer(0.0, 0.0);
+
+  static gpu.BufferView _layoutFlagBuffer(double mip, double cube) {
+    final buffer = gpu.gpuContext.createDeviceBufferWithCopy(
+      ByteData.sublistView(
+        Float32List(4)
+          ..[0] = mip
+          ..[1] = cube,
+      ),
+    );
+    return gpu.BufferView(buffer, offsetInBytes: 0, lengthInBytes: 16);
+  }
+
+  // The engine lighting samplers are frame-invariant, so their options are
+  // shared rather than allocated per draw (this binding path runs for every lit
+  // draw, so at high draw counts the per-draw allocation churn is real).
+  static final gpu.SamplerOptions _radianceMipSampler = gpu.SamplerOptions(
+    minFilter: gpu.MinMagFilter.linear,
+    magFilter: gpu.MinMagFilter.linear,
+    mipFilter: gpu.MipFilter.linear,
+    widthAddressMode: gpu.SamplerAddressMode.repeat,
+    heightAddressMode: gpu.SamplerAddressMode.clampToEdge,
+  );
+  static final gpu.SamplerOptions _radianceAtlasSampler = gpu.SamplerOptions(
+    minFilter: gpu.MinMagFilter.linear,
+    magFilter: gpu.MinMagFilter.linear,
+    mipFilter: gpu.MipFilter.nearest,
+    widthAddressMode: gpu.SamplerAddressMode.repeat,
+    heightAddressMode: gpu.SamplerAddressMode.clampToEdge,
+  );
+  static final gpu.SamplerOptions _cubeSampler = gpu.SamplerOptions(
+    minFilter: gpu.MinMagFilter.linear,
+    magFilter: gpu.MinMagFilter.linear,
+    mipFilter: gpu.MipFilter.linear,
+    widthAddressMode: gpu.SamplerAddressMode.clampToEdge,
+    heightAddressMode: gpu.SamplerAddressMode.clampToEdge,
+  );
+  static final gpu.SamplerOptions _clampLinearSampler = gpu.SamplerOptions(
+    minFilter: gpu.MinMagFilter.linear,
+    magFilter: gpu.MinMagFilter.linear,
+    widthAddressMode: gpu.SamplerAddressMode.clampToEdge,
+    heightAddressMode: gpu.SamplerAddressMode.clampToEdge,
+  );
+  static final gpu.SamplerOptions _nearestSampler = gpu.SamplerOptions(
+    minFilter: gpu.MinMagFilter.nearest,
+    magFilter: gpu.MinMagFilter.nearest,
+  );
+  static final gpu.SamplerOptions _nearestClampSampler = gpu.SamplerOptions(
+    minFilter: gpu.MinMagFilter.nearest,
+    magFilter: gpu.MinMagFilter.nearest,
+    widthAddressMode: gpu.SamplerAddressMode.clampToEdge,
+    heightAddressMode: gpu.SamplerAddressMode.clampToEdge,
+  );
+
+  // Selects the mip-vs-atlas radiance sampler for a prefiltered radiance
+  // texture's layout (the mip layout needs a linear mip filter for textureLod;
+  // the single-level band atlas is inert under either).
+  static gpu.SamplerOptions _radianceSampler(bool mipLayout) =>
+      mipLayout ? _radianceMipSampler : _radianceAtlasSampler;
+
+  /// Binds the prefiltered radiance sampler plus the `RadianceLayoutInfo`
+  /// block that tells `SamplePrefilteredRadiance` which layout the bound
+  /// texture uses. Every engine site that binds `prefiltered_radiance`
+  /// goes through this so the texture and its layout flag never disagree.
+  static void bindPrefilteredRadiance(
+    gpu.RenderPass pass,
+    gpu.Shader shader,
+    EnvironmentMap env,
+  ) {
+    final cubeLayout = env.usesCubeRadianceLayout;
+    final mipLayout = env.usesMipRadianceLayout;
+    // 2D atlas (real on the equirect layouts, a dummy on the cube layout).
+    // Horizontal repeat (longitude wraps), vertical clamp. The mip layout
+    // needs a linear mip filter for textureLod to take effect; the legacy
+    // band atlas has a single level, where the mip filter is inert.
+    pass.bindTexture(
+      shader.getUniformSlot('prefiltered_radiance'),
+      env.prefilteredRadianceTexture,
+      sampler: _radianceSampler(mipLayout),
+    );
+    // Radiance cubemap (real on the cube layout, a dummy otherwise). Mip-linear
+    // for the roughness textureLod; clamp the faces.
+    pass.bindTexture(
+      shader.getUniformSlot('prefiltered_radiance_cube'),
+      env.prefilteredRadianceCube,
+      sampler: _cubeSampler,
+    );
+    pass.bindUniform(
+      shader.getUniformSlot('RadianceLayoutInfo'),
+      cubeLayout ? _layoutCube : (mipLayout ? _layoutMip : _layoutAtlas),
+    );
+  }
+
+  // Pass-scoped memo for the engine-constant bind set. Bindings persist
+  // across draws within a pass, and the lighting samplers plus the fog block
+  // are identical for a given (pass, shader, lighting, environment), so
+  // re-issuing them per item only burns main-thread time (each bind marshals
+  // its slot name across the FFI). The scene encoder invalidates the memo
+  // whenever it clears the pass's bindings (on pipeline changes), keeping the
+  // skip exactly as safe as re-binding.
+  static gpu.RenderPass? _memoPass;
+  static final Map<gpu.Shader, (Lighting, EnvironmentMap)> _texturesMemo = {};
+  static final Map<gpu.Shader, Lighting> _fogMemo = {};
+
+  /// Forgets all memoized bindings; the encoder calls this whenever it clears
+  /// the render pass's bindings.
+  static void invalidateBindMemo() {
+    _memoPass = null;
+    _texturesMemo.clear();
+    _fogMemo.clear();
+  }
+
+  static bool _memoPassIs(gpu.RenderPass pass) {
+    if (identical(pass, _memoPass)) return true;
+    _memoPass = pass;
+    _texturesMemo.clear();
+    _fogMemo.clear();
+    return false;
+  }
+
+  /// Binds the engine image-based-lighting and shadow samplers
+  /// (`prefiltered_radiance`, `brdf_lut`, `shadow_map`) on [shader].
+  static void bindEngineTextures(
+    gpu.RenderPass pass,
+    gpu.Shader shader,
+    Lighting lighting,
+    EnvironmentMap env,
+  ) {
+    if (_memoPassIs(pass)) {
+      final previous = _texturesMemo[shader];
+      if (previous != null &&
+          identical(previous.$1, lighting) &&
+          identical(previous.$2, env)) {
+        return;
+      }
+    }
+    _texturesMemo[shader] = (lighting, env);
+    bindPrefilteredRadiance(pass, shader, env);
+    pass.bindTexture(
+      shader.getUniformSlot('brdf_lut'),
+      Material.getBrdfLutTexture(),
+      sampler: _clampLinearSampler,
+    );
+    pass.bindTexture(
+      shader.getUniformSlot('shadow_map'),
+      Material.whitePlaceholder(lighting.shadowMap),
+      // The atlas is fp32. GLES devices may support rendering/sampling float
+      // textures without GL_OES_texture_float_linear, making linear filtering
+      // incomplete. The shader already performs PCF explicitly, so nearest is
+      // the portable choice.
+      sampler: _nearestSampler,
+    );
+    // Diffuse irradiance SH coefficients, point-sampled (each texel is one
+    // coefficient). During a cross-fade [Lighting.diffuseShTexture] carries a
+    // 9x2 composite holding both environments' rows; otherwise the primary's
+    // own 9x1 texture is bound and both shader row coordinates land on its
+    // single row. Sampled in EvaluateDiffuseSH.
+    pass.bindTexture(
+      shader.getUniformSlot('sh_coefficients'),
+      lighting.diffuseShTexture ?? env.diffuseShTexture,
+      sampler: _nearestClampSampler,
+    );
+    // The secondary cross-fade environment's radiance (the *_b samplers).
+    // When no cross-fade is active the primary is bound here too (a valid
+    // no-op, since frag_info.radiance_blend.x is 0 and the shader never
+    // reads it).
+    bindSecondaryRadiance(pass, shader, lighting.environmentMapB ?? env);
+    // Punctual light parameters (all scene lights) and the per-object light
+    // index buffer, both RGBA32F data textures, point-sampled (each texel is
+    // packed data). White placeholders are bound when there are no lights or no
+    // reached items; the shader never reads them because the per-object count is
+    // 0.
+    pass.bindTexture(
+      shader.getUniformSlot('punctual_lights'),
+      Material.whitePlaceholder(lighting.punctualParamsTexture),
+      sampler: _nearestClampSampler,
+    );
+    pass.bindTexture(
+      shader.getUniformSlot('punctual_index'),
+      Material.whitePlaceholder(lighting.punctualIndexTexture),
+      sampler: _nearestClampSampler,
+    );
+    // Screen-space ambient occlusion. Bilinear so a half-resolution
+    // occlusion buffer upsamples smoothly; a white placeholder makes the
+    // sample a no-op when occlusion is off. The shader gates it on
+    // ssao_params.x regardless.
+    pass.bindTexture(
+      shader.getUniformSlot('ssao_texture'),
+      Material.whitePlaceholder(lighting.ssaoMap),
+      sampler: _clampLinearSampler,
+    );
+  }
+
+  /// Binds the material scene-input samplers for a material that declared
+  /// them (`Material.sceneInputs`); their slots exist only in shaders
+  /// emitted with `engine_inputs`, so this must not run for other
+  /// materials. Placeholders cover frames where an input was not produced
+  /// (the `scene_inputs` gates read 0 then).
+  static void bindSceneInputTextures(
+    gpu.RenderPass pass,
+    gpu.Shader shader,
+    Lighting lighting,
+    Set<RenderInput> sceneInputs,
+  ) {
+    if (sceneInputs.contains(RenderInput.opaqueSceneColor)) {
+      pass.bindTexture(
+        shader.getUniformSlot('scene_opaque_color'),
+        Material.whitePlaceholder(lighting.opaqueSceneColor),
+        sampler: _clampLinearSampler,
+      );
+    }
+    if (sceneInputs.contains(RenderInput.depth)) {
+      pass.bindTexture(
+        shader.getUniformSlot('scene_depth'),
+        Material.whitePlaceholder(lighting.sceneDepthLinear),
+        sampler: _nearestClampSampler,
+      );
+    }
+  }
+
+  /// Binds the secondary cross-fade environment's prefiltered radiance to the
+  /// `prefiltered_radiance_b` / `prefiltered_radiance_cube_b` samplers (the
+  /// specular pair only, no diffuse SH). Shared by the lit material and the
+  /// environment skybox; both share the primary's [RadianceLayoutInfo], so the
+  /// layout flag is not re-bound here.
+  static void bindSecondaryRadiance(
+    gpu.RenderPass pass,
+    gpu.Shader shader,
+    EnvironmentMap env,
+  ) {
+    final mipLayout = env.usesMipRadianceLayout;
+    pass.bindTexture(
+      shader.getUniformSlot('prefiltered_radiance_b'),
+      env.prefilteredRadianceTexture,
+      sampler: _radianceSampler(mipLayout),
+    );
+    pass.bindTexture(
+      shader.getUniformSlot('prefiltered_radiance_cube_b'),
+      env.prefilteredRadianceCube,
+      sampler: _cubeSampler,
+    );
+  }
+}

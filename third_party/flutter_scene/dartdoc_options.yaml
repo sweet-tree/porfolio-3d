@@ -1,0 +1,17 @@
+dartdoc:
+  categoryOrder:
+    - "Scene graph"
+    - "Geometry"
+    - "Materials"
+    - "Lighting and environment"
+    - "Rendering"
+    - "Particles"
+    - "Animation"
+    - "Physics"
+    - "Audio"
+    - "Picking and input"
+    - "Widgets"
+    - "Accessibility"
+    - "Gaussian splatting"
+    - "Assets and loading"
+    - "Noise"
