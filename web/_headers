@@ -1,0 +1,31 @@
+# Cloudflare Pages response headers.
+#
+# Flutter copies everything in web/ into build/web, so this file lands at the
+# deployment root where Pages expects it.
+
+/*
+  # Cross-origin isolation. Without BOTH of these the browser silently drops to
+  # the single-threaded renderer — no error, just a slower app.
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+  # Basic hardening; none of these affect rendering.
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+
+# The entry point must never be cached, or visitors keep loading an old build
+# that points at asset names which no longer exist.
+/index.html
+  Cache-Control: no-cache, must-revalidate
+
+/flutter_bootstrap.js
+  Cache-Control: no-cache, must-revalidate
+
+# Content-hashed and version-pinned payloads are safe to cache hard.
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
+
+/canvaskit/*
+  Cache-Control: public, max-age=31536000, immutable
+
+/*.wasm
+  Cache-Control: public, max-age=31536000, immutable

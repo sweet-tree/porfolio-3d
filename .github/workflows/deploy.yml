@@ -1,0 +1,55 @@
+name: Deploy to Cloudflare Pages
+
+on:
+  push:
+    branches: [main]
+  # Lets you redeploy from the Actions tab without pushing a commit.
+  workflow_dispatch:
+
+concurrency:
+  # A newer push makes an in-flight deploy irrelevant.
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          # Pinned deliberately. The vendored fork in third_party/ was verified
+          # against this exact version; a floating "stable" could change the
+          # engine under us without warning.
+          flutter-version: 3.44.7
+          channel: stable
+          cache: true
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Verify
+        run: |
+          flutter analyze
+          flutter test
+
+      - name: Build (WebAssembly, release)
+        # Flutter also emits the JavaScript build alongside as an automatic
+        # fallback for browsers without WasmGC — notably every browser on iOS.
+        run: flutter build web --wasm --release
+
+      - name: Confirm _headers survived the build
+        # Cross-origin isolation depends on this file reaching the deploy root.
+        # If it is ever missing the app still works, just slower and silently —
+        # so fail loudly here instead.
+        run: test -f build/web/_headers
+
+      - name: Deploy
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy build/web --project-name=porfolio-3d
