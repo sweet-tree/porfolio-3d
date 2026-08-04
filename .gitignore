@@ -43,3 +43,9 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Design reference images are licensed stock, kept locally only.
+# See docs/reference/README.md for what we take from them.
+docs/reference/*.jpeg
+docs/reference/*.jpg
+docs/reference/*.png

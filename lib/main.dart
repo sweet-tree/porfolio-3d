@@ -4,15 +4,16 @@
 // leaf texture, and the per-leaf shading. Nothing is downloaded, so the whole
 // hero costs zero bytes of payload beyond the code itself.
 //
-// The configuration here is the one measured to be best on real hardware
-// (see docs/flutter-scene-web-leak.md):
+// Every number here came from measuring on real hardware rather than from
+// reasoning — see docs/flutter-scene-web-leak.md for the workings.
 //
-//   20,000 leaves at size 0.5 → 60 fps desktop, 30 fps on an iPhone 11,
-//   and visually better than larger leaves, which over-cover the canopy
-//   into a solid blob.
+// The dominant cost is fill rate: how many leaf-pixels get drawn, which is why
+// the same scene runs at 57 fps when the tree is small in frame and 27 when it
+// fills it. Leaf count barely matters by comparison. Bloom, wind and the alpha
+// leaf texture were each measured to cost nothing, so all three are on.
 //
-// Bloom, wind, and the alpha leaf texture were all measured to cost nothing,
-// so they are all on.
+// Density is tunable from the URL (?leaves=&size=) so it can be adjusted
+// against a real phone rather than guessed at here.
 import 'dart:async';
 import 'dart:math' as math;
 import 'dart:typed_data';
@@ -21,6 +22,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter_scene/scene.dart';
 import 'package:showcase/src/leaf_texture.dart';
+import 'package:showcase/src/query_params.dart';
 import 'package:showcase/src/stats_overlay.dart';
 import 'package:vector_math/vector_math.dart' as vm;
 
@@ -56,11 +58,26 @@ class TreeHero extends StatefulWidget {
 
 class _TreeHeroState extends State<TreeHero>
     with SingleTickerProviderStateMixin {
-  static const int _leafCount = 20000;
-
-  /// Measured sweet spot. Larger over-covers the canopy into a blob; smaller
-  /// breaks it up into gaps. Cost scales with this roughly linearly.
-  static const double _leafScale = 0.5;
+  // ── Canopy density ───────────────────────────────────────────────────────
+  //
+  // Two quantities, related but NOT interchangeable:
+  //
+  //   cost     ∝ count × size      (measured: halving size halves the cost)
+  //   coverage ∝ count × size²
+  //
+  // So for a fixed visual density, FEWER LARGER leaves are cheaper. Holding
+  // coverage constant while halving size needs 4× the leaves and doubles the
+  // work. 20,000 @ 0.5 and 8,000 @ 0.8 cover the same canopy, but the second
+  // costs about a third less:
+  //
+  //   20000 × 0.5  = 10000 cost, 20000 × 0.25 = 5000 coverage
+  //    8000 × 0.8  =  6400 cost,  8000 × 0.64 = 5120 coverage
+  //
+  // Overridable from the URL (?leaves=8000&size=0.8) so this can be tuned on a
+  // real device without a deploy cycle — the numbers that matter come from the
+  // phone, not from here.
+  static final int _leafCount = qInt('leaves', 8000);
+  static final double _leafScale = qDouble('size', 0.8);
 
   // ── Tree extents, shared by the generator and the camera ────────────────
   // The camera derives its framing from these, so changing the tree's shape

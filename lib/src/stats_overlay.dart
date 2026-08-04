@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
+import 'package:showcase/src/query_params.dart';
 import 'package:web/web.dart' as web;
 
 /// True when the page was opened with `?stats=1`.
@@ -9,7 +10,7 @@ import 'package:web/web.dart' as web;
 /// A URL switch rather than a debug build flag, so the numbers can be read off
 /// a real phone hitting the real deployment — which is the only place some of
 /// them (cross-origin isolation, the JS-vs-WebAssembly path) mean anything.
-bool get statsRequested => Uri.base.queryParameters['stats'] == '1';
+bool get statsRequested => qFlag('stats');
 
 /// True when compiled by dart2js rather than dart2wasm.
 ///
