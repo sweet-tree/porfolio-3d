@@ -21,6 +21,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter_scene/scene.dart';
 import 'package:showcase/src/leaf_texture.dart';
+import 'package:showcase/src/stats_overlay.dart';
 import 'package:vector_math/vector_math.dart' as vm;
 
 void main() => runApp(const ShowcaseApp());
@@ -29,10 +30,20 @@ class ShowcaseApp extends StatelessWidget {
   const ShowcaseApp({super.key});
 
   @override
-  Widget build(BuildContext context) => const MaterialApp(
+  Widget build(BuildContext context) => MaterialApp(
     title: 'Showcase',
     debugShowCheckedModeBanner: false,
-    home: Scaffold(backgroundColor: Color(0xFF07070E), body: TreeHero()),
+    home: Scaffold(
+      backgroundColor: const Color(0xFF07070E),
+      body: Stack(
+        children: [
+          const TreeHero(),
+          // Opt-in via ?stats=1 — the only way to get honest numbers is to
+          // read them off the real device hitting the real deployment.
+          if (statsRequested) const StatsOverlay(),
+        ],
+      ),
+    ),
   );
 }
 
