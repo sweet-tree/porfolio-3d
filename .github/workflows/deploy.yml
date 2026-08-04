@@ -20,7 +20,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: subosito/flutter-action@v2
         with:
@@ -57,7 +57,11 @@ jobs:
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           # Cloudflare treats the project's production branch specially: `main`
           # publishes to the live URL, anything else gets its own preview URL.
+          # --commit-dirty silences a warning about the working tree: `flutter
+          # pub get` touches files during the build, which wrangler notices and
+          # reports even though the deployed output is exactly what we built.
           command: >-
             pages deploy build/web
             --project-name=porfolio-3d-3gm
             --branch=${{ github.head_ref || github.ref_name }}
+            --commit-dirty=true
