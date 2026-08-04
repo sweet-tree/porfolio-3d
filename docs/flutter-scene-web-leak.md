@@ -255,9 +255,33 @@ So **for constant visual density, smaller leaves are worse**: halving size needs
 4× the leaves to hold coverage, which doubles the cost. Smaller only wins while
 the canopy is *over*-covered.
 
-**Chosen configuration: 20,000 leaves at size 0.5** — 60 fps desktop, 30 fps
-iPhone 11, and visually better than size 1.0, which was an over-covered blob.
-At size 0.25 the canopy visibly breaks up (gaps, trunk showing through).
+### Framing dominates all of it
+
+The measurements above hold the camera fixed. Change how much of the SCREEN the
+tree covers and everything moves:
+
+| Framing (same scene, same leaves) | FPS |
+|---|---|
+| tree small in a portrait frame | 57 |
+| tree filling a landscape frame | 27 |
+
+So fill rate is the real cost model, and any budget stated as a leaf count is
+meaningless without saying how large the tree is on screen. Fitting the camera to
+a portrait viewport took 32 fps to 57 *and* stopped the crown being cropped —
+composition and performance are the same decision here.
+
+**Real iPhone 11, production HTTPS, portrait full-screen: 35 fps**, JavaScript
+build, `crossOriginIsolated: true`. That supersedes every LAN and emulated figure
+above.
+
+### Current configuration
+
+**8,000 leaves at size 0.8** — same coverage as 20,000 @ 0.5 for about a third
+less work (60 fps against 37 in landscape). Tunable at runtime via
+`?leaves=&size=`.
+
+Treat it as provisional: the canopy is going to be rebuilt around the branch
+structure (see `reference/README.md`), and the right numbers will be different.
 
 ## Open questions before filing
 
