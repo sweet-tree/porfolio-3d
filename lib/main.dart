@@ -62,9 +62,58 @@ class _TreeHeroState extends State<TreeHero>
   /// breaks it up into gaps. Cost scales with this roughly linearly.
   static const double _leafScale = 0.5;
 
+  // ── Tree extents, shared by the generator and the camera ────────────────
+  // The camera derives its framing from these, so changing the tree's shape
+  // cannot silently leave the framing wrong.
+
+  /// Horizontal radius of the crown.
+  static const double _crownRadius = 3.4;
+
+  /// Height of the crown's centre above the ground.
+  static const double _crownCentreY = 4.3;
+
+  /// Vertical squash: the crown is wider than it is tall.
+  static const double _crownSquash = 0.70;
+
+  /// Vertical field of view. The horizontal one is derived from this and the
+  /// viewport's aspect ratio at render time.
+  static const double _fovY = 50 * math.pi / 180;
+
+  /// Padding around the tree, as a multiple of the fitted distance.
+  static const double _framingMargin = 1.06;
+
   /// Direction the key light comes from. Leaves on the far side of the canopy
   /// from the camera relative to this are lit through — see [_onTick].
   static final vm.Vector3 _lightDir = vm.Vector3(-0.45, 0.75, 0.5)..normalize();
+
+  /// Highest point of the tree: the top of the crown.
+  static const double _treeTop = _crownCentreY + _crownRadius * _crownSquash;
+
+  /// Point the camera looks at — the middle of the tree's full height, so the
+  /// trunk and the crown are framed together rather than the crown alone.
+  static final vm.Vector3 _treeCentre = vm.Vector3(0, _treeTop / 2, 0);
+
+  /// Radius of the sphere enclosing the whole tree, measured from
+  /// [_treeCentre]. The widest points are the crown's edge, so this is the
+  /// distance from the centre out to the crown rim.
+  static final double _treeRadius = math.sqrt(
+    _crownRadius * _crownRadius +
+        math.pow(_crownCentreY - _treeTop / 2, 2).toDouble(),
+  );
+
+  /// Distance the camera must sit at for the whole tree to fit a viewport of
+  /// the given [aspect] ratio.
+  ///
+  /// The vertical field of view is fixed; the horizontal one follows from it
+  /// and the aspect ratio. In portrait the horizontal field is the NARROWER
+  /// of the two, so fitting only vertically — which is what
+  /// `PerspectiveCamera.framing` does, by its own documentation — crops the
+  /// crown left and right. Fitting whichever axis is tighter is the fix.
+  static double _framingDistance(double aspect) {
+    final fovX = 2 * math.atan(math.tan(_fovY / 2) * aspect);
+    final limiting = math.min(_fovY, fovX);
+    return _treeRadius / math.sin(limiting / 2) * _framingMargin;
+  }
 
   final Scene scene = Scene();
   bool _ready = false;
@@ -202,24 +251,24 @@ class _TreeHeroState extends State<TreeHero>
       // Crown shape: a squashed sphere, denser toward the outside, which is
       // roughly how real foliage distributes.
       final u = rng.nextDouble();
-      final r = 3.4 * math.pow(u, 0.34).toDouble();
+      final r = _crownRadius * math.pow(u, 0.34).toDouble();
       final theta = rng.nextDouble() * math.pi * 2;
       final phi = math.acos(1 - 2 * rng.nextDouble());
 
       _restX[i] = r * math.sin(phi) * math.cos(theta);
-      _restY[i] = r * math.cos(phi) * 0.70 + 4.3;
+      _restY[i] = r * math.cos(phi) * _crownSquash + _crownCentreY;
       _restZ[i] = r * math.sin(phi) * math.sin(theta);
       _phase[i] = rng.nextDouble() * math.pi * 2;
       _sizeW[i] = (0.17 + rng.nextDouble() * 0.13) * _leafScale;
       _sizeH[i] = _sizeW[i] * (1.5 + rng.nextDouble() * 0.5);
       _rot[i] = rng.nextDouble() * math.pi * 2;
-      _depth[i] = 1.0 - (r / 3.4).clamp(0.0, 1.0);
+      _depth[i] = 1.0 - (r / _crownRadius).clamp(0.0, 1.0);
 
       // Hue sweep across the crown, and much darker toward the interior.
       // Depth falloff is deliberately steep and non-linear: a canopy that is
       // uniformly lit reads as a flat silhouette, and the eye takes the dark
       // interior as the cue that there is volume behind the surface.
-      final hue = (_restX[i] / 3.4 + 1) / 2;
+      final hue = (_restX[i] / _crownRadius + 1) / 2;
       final shade = 0.10 + 0.90 * math.pow(1 - _depth[i], 2.2).toDouble();
       _baseRGB[i * 3] = (0.30 + 0.85 * hue) * shade;
       _baseRGB[i * 3 + 1] = (0.22 + 0.40 * (1 - hue)) * shade;
@@ -309,18 +358,31 @@ class _TreeHeroState extends State<TreeHero>
     }
     if (!_ready) return const Center(child: CircularProgressIndicator());
 
-    return SceneView(
-      scene,
-      cameraBuilder: (elapsed) {
-        final t = elapsed.inMilliseconds / 1000.0;
-        _cameraPos = vm.Vector3(
-          math.cos(t * 0.16) * 11.5,
-          4.6 + math.sin(t * 0.11) * 1.1,
-          math.sin(t * 0.16) * 11.5,
-        );
-        return PerspectiveCamera(
-          position: _cameraPos,
-          target: vm.Vector3(0, 3.9, 0),
+    // The viewport drives the framing, so the camera has to know its size.
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final aspect = constraints.maxHeight <= 0
+            ? 1.0
+            : constraints.maxWidth / constraints.maxHeight;
+        final distance = _framingDistance(aspect);
+
+        return SceneView(
+          scene,
+          cameraBuilder: (elapsed) {
+            final t = elapsed.inMilliseconds / 1000.0;
+            // Orbit at the fitted distance, with a gentle vertical drift kept
+            // proportional so it never pushes the crown out of frame.
+            _cameraPos = vm.Vector3(
+              math.cos(t * 0.16) * distance,
+              _treeCentre.y + distance * 0.06 * math.sin(t * 0.11),
+              math.sin(t * 0.16) * distance,
+            );
+            return PerspectiveCamera(
+              fovRadiansY: _fovY,
+              position: _cameraPos,
+              target: _treeCentre,
+            );
+          },
         );
       },
     );
