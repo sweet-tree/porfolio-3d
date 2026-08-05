@@ -76,8 +76,10 @@ check: analyze test
 analyze:
 	flutter analyze
 
+# In a browser, not on the Dart VM: flutter_scene only compiles against the
+# web flutter_gpu backend on stable, so a VM test that imports it fails to load.
 test:
-	flutter test
+	flutter test --platform chrome
 
 fmt:
 	dart format lib test

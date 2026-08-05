@@ -35,9 +35,14 @@ jobs:
         run: flutter pub get
 
       - name: Verify
+        # Tests run in a browser, not on the Dart VM. flutter_scene compiles
+        # against flutter_gpu's native API off the web target, and stable's
+        # native flutter_gpu is missing members the package uses — so any test
+        # that imports it fails to LOAD on the VM. This is a web-only app;
+        # running its tests anywhere else was always testing the wrong build.
         run: |
           flutter analyze
-          flutter test
+          flutter test --platform chrome
 
       - name: Build (WebAssembly, release)
         # Flutter also emits the JavaScript build alongside as an automatic
