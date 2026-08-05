@@ -62,17 +62,24 @@ jobs:
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           # Cloudflare treats the project's production branch specially: `main`
           # publishes to the live URL, anything else gets its own preview URL.
+          #
           # The project name is what the dashboard URL says
-          # (/pages/view/porfolio-3d) — NOT the pages.dev subdomain, which
+          # (/pages/view/portfolio-3d) — NOT the pages.dev subdomain, which
           # carries an extra suffix Cloudflare appends when the plain name is
-          # already taken. The public site is porfolio-3d-3gm.pages.dev; the
-          # project is porfolio-3d.
+          # already taken. Live site: portfolio-3d-blz.pages.dev. Project:
+          # portfolio-3d.
+          #
+          # A Pages project name can NEVER be renamed. The first project here
+          # was created as `porfolio-3d`, missing a letter, and the only way to
+          # correct it was to make a new project and abandon the old URL — which
+          # is what happened on 2026-08-05. Get public-facing names right the
+          # first time.
           #
           # --commit-dirty silences a warning about the working tree: `flutter
           # pub get` touches files during the build, which wrangler notices and
           # reports even though the deployed output is exactly what we built.
           command: >-
             pages deploy build/web
-            --project-name=porfolio-3d
+            --project-name=portfolio-3d
             --branch=${{ github.head_ref || github.ref_name }}
             --commit-dirty=true
